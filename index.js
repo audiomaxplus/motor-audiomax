@@ -20,6 +20,8 @@ app.use(express.json());
 const sesiones = {};
 const codigosQR = {};
 const estadoConexion = {};
+// Buzón en memoria para entregar mensajes en tiempo real a tu pantalla
+const buzonMensajes = [];
 const logger = pino({ level: 'silent' });
 
 function limpiarCarpetaSesion(idMarca) {
@@ -29,7 +31,6 @@ function limpiarCarpetaSesion(idMarca) {
   }
 }
 
-// Normaliza números de México: quita el '1' después de '52' para que WhatsApp Business acepte el código
 function normalizarTelefonoMexico(tel) {
   let limpio = (tel || '').replace(/\D/g, '');
   if (limpio.length === 10) return '52' + limpio;
@@ -37,6 +38,19 @@ function normalizarTelefonoMexico(tel) {
     return '52' + limpio.substring(3);
   }
   return limpio;
+}
+
+function extraerTextoMensaje(msg) {
+  if (!msg || !msg.message) return '';
+  return (
+    msg.message.conversation ||
+    msg.message.extendedTextMessage?.text ||
+    msg.message.imageMessage?.caption ||
+    msg.message.videoMessage?.caption ||
+    msg.message.buttonsResponseMessage?.selectedDisplayText ||
+    msg.message.listResponseMessage?.title ||
+    ''
+  );
 }
 
 async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
@@ -62,7 +76,6 @@ async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
-    // Mac OS Desktop pasa directo los filtros de WhatsApp Business
     browser: Browsers.macOS('Desktop'),
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
@@ -88,14 +101,13 @@ async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
     if (connection === 'open') {
       codigosQR[idMarca] = null;
       estadoConexion[idMarca] = 'CONECTADO_24_7';
-      console.log(`Marca ${idMarca} CONECTADA.`);
+      console.log(`Marca ${idMarca} CONECTADA 24/7.`);
     }
 
     if (connection === 'close') {
       delete sesiones[idMarca];
       const codigo = lastDisconnect?.error?.output?.statusCode;
       if (codigo === 515) {
-        // 515 es normal tras escanear QR: reconectar de inmediato sin borrar credenciales
         iniciarSesionWhatsApp(idMarca, false);
       } else if (codigo === DisconnectReason.loggedOut || codigo === 401 || codigo === 403) {
         limpiarCarpetaSesion(idMarca);
@@ -106,11 +118,45 @@ async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
     }
   });
 
+  // 📡 ESCUCHAR MENSAJES REALES ENTRANTES DE WHATSAPP BUSINESS
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify' && type !== 'append') return;
+
+    for (const msg of messages) {
+      if (!msg.message) continue;
+      const jid = msg.key.remoteJid || '';
+      if (jid.includes('@g.us') || jid === 'status@broadcast') continue;
+
+      const texto = extraerTextoMensaje(msg).trim();
+      if (!texto) continue;
+
+      const esMio = Boolean(msg.key.fromMe);
+      const telefonoLimpio = jid.split('@')[0];
+      const nombreContacto = msg.pushName || (`Paciente ${telefonoLimpio.slice(-4)}`);
+
+      const nuevoEvento = {
+        id: msg.key.id || ('msg_' + Date.now() + Math.random()),
+        marcaId: idMarca,
+        jid: jid,
+        telefono: telefonoLimpio,
+        nombre: nombreContacto,
+        texto: texto,
+        fromMe: esMio,
+        timestamp: Date.now(),
+        hora: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })
+      };
+
+      buzonMensajes.push(nuevoEvento);
+      if (buzonMensajes.length > 300) buzonMensajes.shift();
+      console.log(`[${idMarca}] Mensaje de ${nombreContacto}: ${texto}`);
+    }
+  });
+
   return sock;
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, motor: 'AudioMax Business Ligero Activo', marcas: estadoConexion });
+  res.json({ ok: true, motor: 'AudioMax Business Activo con Buzón en Vivo', marcas: estadoConexion });
 });
 
 app.get('/qr-json', async (req, res) => {
@@ -135,7 +181,7 @@ app.get('/codigo-8-letras', async (req, res) => {
       try {
         const code = await sock.requestPairingCode(telefono);
         const formateado = code?.match(/.{1,4}/g)?.join('-') || code;
-        res.json({ ok: true, codigo: formateado, numeroUsado: telefono });
+        res.json({ ok: true, codigo: formateado });
       } catch (e) {
         res.json({ ok: false, codigo: 'ERROR' });
       }
@@ -145,9 +191,34 @@ app.get('/codigo-8-letras', async (req, res) => {
   }
 });
 
+// 📥 RUTA PARA QUE TU PÁGINA RECIBA LOS MENSAJES EN TIEMPO REAL CADA 3 SEGUNDOS
+app.get('/mensajes-nuevos', (req, res) => {
+  const desde = parseInt(req.query.desde || '0', 10);
+  const nuevos = buzonMensajes.filter(m => m.timestamp > desde);
+  res.json({ ok: true, mensajes: nuevos, estado: estadoConexion });
+});
+
+// 📤 RUTA PARA ENVIAR MENSAJES REALES (DE DIANA O TUYOS) AL WHATSAPP DEL PACIENTE
+app.post('/enviar-mensaje', async (req, res) => {
+  try {
+    const { sesion = 'audiomax', jid, telefono, texto } = req.body;
+    const sock = sesiones[sesion];
+    if (!sock) return res.json({ ok: false, error: 'Sesión no conectada' });
+
+    let destino = jid;
+    if (!destino && telefono) {
+      destino = telefono.replace(/\D/g, '') + '@s.whatsapp.net';
+    }
+    await sock.sendMessage(destino, { text: texto });
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log('Motor Business corriendo en puerto ' + PORT);
+  console.log('Motor Business con Buzón en Vivo corriendo en puerto ' + PORT);
   iniciarSesionWhatsApp('audiomax');
   iniciarSesionWhatsApp('audiaplus');
 });
