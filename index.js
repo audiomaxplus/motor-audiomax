@@ -29,6 +29,16 @@ function limpiarCarpetaSesion(idMarca) {
   }
 }
 
+// Normaliza números de México: quita el '1' después de '52' para que WhatsApp Business acepte el código
+function normalizarTelefonoMexico(tel) {
+  let limpio = (tel || '').replace(/\D/g, '');
+  if (limpio.length === 10) return '52' + limpio;
+  if (limpio.length === 13 && limpio.startsWith('521')) {
+    return '52' + limpio.substring(3);
+  }
+  return limpio;
+}
+
 async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
   if (forzarReinicio) {
     if (sesiones[idMarca]) {
@@ -52,14 +62,16 @@ async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
-    // Identificador oficial requerido por WhatsApp Business para no rechazar el QR
-    browser: Browsers.ubuntu('Chrome'),
-    // Evita que WhatsApp Business se trabe descargando miles de chats antiguos
+    // Mac OS Desktop pasa directo los filtros de WhatsApp Business
+    browser: Browsers.macOS('Desktop'),
     syncFullHistory: false,
-    markOnlineOnConnect: true,
-    connectTimeoutMs: 60000,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000
+    shouldSyncHistoryMessage: () => false,
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false,
+    connectTimeoutMs: 90000,
+    defaultQueryTimeoutMs: 90000,
+    keepAliveIntervalMs: 20000,
+    getMessage: async () => ({ conversation: 'AudioMaxPlus' })
   });
 
   sesiones[idMarca] = sock;
@@ -76,30 +88,20 @@ async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
     if (connection === 'open') {
       codigosQR[idMarca] = null;
       estadoConexion[idMarca] = 'CONECTADO_24_7';
-      console.log(`Marca ${idMarca} vinculada exitosamente.`);
+      console.log(`Marca ${idMarca} CONECTADA.`);
     }
 
     if (connection === 'close') {
       delete sesiones[idMarca];
-      const codigoSalida = lastDisconnect?.error?.output?.statusCode;
-
-      // Si WhatsApp rechazó la sesión o se cerró desde el celular, limpiamos basura
-      if (
-        codigoSalida === DisconnectReason.loggedOut ||
-        codigoSalida === DisconnectReason.badSession ||
-        codigoSalida === 401 ||
-        codigoSalida === 515
-      ) {
-        if (codigoSalida === 515) {
-          // Código 515 en WhatsApp Business: pide reconexión inmediata tras escanear QR
-          setTimeout(() => iniciarSesionWhatsApp(idMarca, false), 1500);
-        } else {
-          limpiarCarpetaSesion(idMarca);
-          estadoConexion[idMarca] = 'DESCONECTADO';
-          setTimeout(() => iniciarSesionWhatsApp(idMarca, false), 2000);
-        }
+      const codigo = lastDisconnect?.error?.output?.statusCode;
+      if (codigo === 515) {
+        // 515 es normal tras escanear QR: reconectar de inmediato sin borrar credenciales
+        iniciarSesionWhatsApp(idMarca, false);
+      } else if (codigo === DisconnectReason.loggedOut || codigo === 401 || codigo === 403) {
+        limpiarCarpetaSesion(idMarca);
+        estadoConexion[idMarca] = 'DESCONECTADO';
       } else {
-        setTimeout(() => iniciarSesionWhatsApp(idMarca, false), 3000);
+        setTimeout(() => iniciarSesionWhatsApp(idMarca, false), 2500);
       }
     }
   });
@@ -108,10 +110,9 @@ async function iniciarSesionWhatsApp(idMarca, forzarReinicio = false) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, motor: 'AudioMax & Audia Plus Business 24/7', marcas: estadoConexion });
+  res.json({ ok: true, motor: 'AudioMax Business Ligero Activo', marcas: estadoConexion });
 });
 
-// Ruta JSON para QR (Permite limpiar sesión trabada con &reset=1)
 app.get('/qr-json', async (req, res) => {
   const sesion = req.query.sesion || 'audiomax';
   const reset = req.query.reset === '1';
@@ -123,24 +124,22 @@ app.get('/qr-json', async (req, res) => {
   });
 });
 
-// Ruta para Código de 8 Letras optimizada para WhatsApp Business
 app.get('/codigo-8-letras', async (req, res) => {
   try {
     const sesion = req.query.sesion || 'audiomax';
-    const telefono = (req.query.telefono || '').replace(/\D/g, '');
-    if (telefono.length < 12) return res.json({ ok: false, codigo: 'ERROR' });
+    const telefono = normalizarTelefonoMexico(req.query.telefono);
+    if (telefono.length < 12) return res.json({ ok: false, codigo: 'ERROR_FORMATO' });
 
-    // Reiniciamos limpio para que el código de 8 letras sea fresco
     const sock = await iniciarSesionWhatsApp(sesion, true);
     setTimeout(async () => {
       try {
         const code = await sock.requestPairingCode(telefono);
         const formateado = code?.match(/.{1,4}/g)?.join('-') || code;
-        res.json({ ok: true, codigo: formateado });
+        res.json({ ok: true, codigo: formateado, numeroUsado: telefono });
       } catch (e) {
         res.json({ ok: false, codigo: 'ERROR' });
       }
-    }, 3500);
+    }, 4000);
   } catch (e) {
     res.json({ ok: false, codigo: 'ERROR' });
   }
@@ -148,7 +147,7 @@ app.get('/codigo-8-letras', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log('Motor WhatsApp Business corriendo en puerto ' + PORT);
+  console.log('Motor Business corriendo en puerto ' + PORT);
   iniciarSesionWhatsApp('audiomax');
   iniciarSesionWhatsApp('audiaplus');
 });
